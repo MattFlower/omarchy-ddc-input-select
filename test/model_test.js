@@ -10,7 +10,11 @@ const SRC = path.join(__dirname, "..", "Model.js")
 const EXPORTS = [
   "normalizeCode", "parseConfig", "configIsMalformed", "visibleInputs",
   "parseCurrentCode", "parseCapabilities", "mergeInputs", "labelFor",
-  "defaultNameFor", "ddcutilArgs", "moveIndex", "seedConfigJson", "parentDir"
+  "defaultNameFor", "ddcutilArgs", "moveIndex", "parentDir",
+  "resolveInput", "normalizeBind", "bindingsLua", "hasBindings",
+  "parseBind", "formatBind", "canonicalBind", "keyNameFor", "modsFromMask",
+  "hyprConflicts", "inputConflicts", "configWithInput", "enterRecordSubmapCommand",
+  "leaveRecordSubmapArgs", "shellQuote"
 ]
 
 const M = {}
@@ -128,25 +132,150 @@ eq(M.mergeInputs(discovered, []).map(e => e.name),
    ["Input 0x19", "DisplayPort-1", "Input 0x13", "HDMI-1", "HDMI-2"],
    "merge: config-free install is driven entirely by the monitor")
 
-// --- seeding a first config -----------------------------------------------
-// The seed is what the "Name these inputs" button writes before opening the
-// editor, so it has to survive being read straight back by parseConfig.
-const seeded = M.seedConfigJson(M.mergeInputs(discovered, []))
-eq(M.parseConfig(seeded).map(e => e.code), discovered,
-   "seed: round-trips through parseConfig with codes intact")
-eq(M.configIsMalformed(seeded), false, "seed: is valid JSON")
-eq(M.parseConfig(M.seedConfigJson([{ code: "0x11", name: 'He said "hi"\\' }]))[0].name,
-   'He said "hi"\\', "seed: quotes and backslashes in a name are escaped")
-eq(M.seedConfigJson([]), '{\n  "inputs": [\n\n  ]\n}\n', "seed: empty list is still valid")
-
 eq(M.parentDir("/home/u/.config/ddc-input-select/inputs.json"),
    "/home/u/.config/ddc-input-select", "parentDir: normal path")
 eq(M.parentDir("/inputs.json"), "/", "parentDir: root")
 eq(M.parentDir("inputs.json"), "/", "parentDir: bare filename")
 
-// The cursor space is rows + 1: the last stop is the edit control.
-eq(M.moveIndex(4, 1, 6), 5, "cursor: steps onto the edit control")
-eq(M.moveIndex(5, 1, 6), 0, "cursor: wraps from the edit control to the first row")
+
+// --- per-input shortcuts ---------------------------------------------------
+const bound = M.parseConfig(JSON.stringify({
+  inputs: [
+    { code: "0x01", name: "VGA", bind: "SHIFT + CTRL + 1" },
+    { code: "0x0f", name: "DisplayPort", bind: "  SHIFT +  CTRL\n+ 2 " },
+    { code: "0x11", name: 'Work "Laptop"', bind: "SHIFT + CTRL + 3", hidden: true },
+    { code: "0x12", name: "HDMI 2" }
+  ]
+}))
+eq(bound.map(e => e.bind), ["SHIFT + CTRL + 1", "SHIFT + CTRL + 2", "SHIFT + CTRL + 3", ""],
+   "bind: parsed, whitespace tidied, absent is empty")
+eq(M.mergeInputs(["0x01", "0x0f"], bound)[0].bind, "SHIFT + CTRL + 1",
+   "bind: survives the merge")
+eq(M.mergeInputs(["0x13"], [])[0].bind, "", "bind: discovered-only input has none")
+eq(M.hasBindings(bound), true, "bind: hasBindings with binds")
+eq(M.hasBindings(M.parseConfig('{"inputs":[{"code":"0x11"}]}')), false,
+   "bind: hasBindings without binds")
+eq(M.normalizeBind(null), "", "bind: null is empty")
+
+const lua = M.bindingsLua(bound, "ddc-input")
+eq(lua.split("\n").filter(l => l.startsWith("o.bind(")), [
+  'o.bind("SHIFT + CTRL + 1", "Monitor input: VGA", "omarchy-shell -q ddc-input set 0x01")',
+  'o.bind("SHIFT + CTRL + 2", "Monitor input: DisplayPort", "omarchy-shell -q ddc-input set 0x0f")',
+  'o.bind("SHIFT + CTRL + 3", "Monitor input: Work \\"Laptop\\"", "omarchy-shell -q ddc-input set 0x11")'
+], "lua: one bind per bound input, hidden included, quotes escaped")
+eq(lua.endsWith("\n"), true, "lua: ends with a newline")
+eq(M.bindingsLua([], "ddc-input").includes("-- No shortcuts configured."), true,
+   "lua: empty list still renders a valid module")
+eq(M.bindingsLua([], "ddc-input").includes("o.bind("), false, "lua: empty list binds nothing")
+eq(M.bindingsLua([], "ddc-input").includes('hl.define_submap("ddc-input-select-record"'), true,
+   "lua: defines the record submap")
+const overriding = M.parseConfig('{"inputs":[{"code":"0x11","name":"HDMI","bind":"SUPER + W","override":true}]}')
+eq(overriding[0].override, true, "override: parsed")
+eq(M.mergeInputs(["0x11"], overriding)[0].override, true, "override: survives the merge")
+eq(M.bindingsLua(overriding, "ddc-input").split("\n").filter(l => /^(hl\.unbind|o\.bind)/.test(l)), [
+  'hl.unbind("SUPER + W")',
+  'o.bind("SUPER + W", "Monitor input: HDMI", "omarchy-shell -q ddc-input set 0x11")'
+], "override: unbinds the combination before binding it")
+
+eq(M.shellQuote("it's"), "'it'\\''s'", "shellQuote: single quote")
+eq(M.enterRecordSubmapCommand(),
+   "hyprctl dispatch 'hl.dsp.submap(\"ddc-input-select-record\")' >/dev/null || "
+   + "{ hyprctl eval 'hl.define_submap(\"ddc-input-select-record\", function() "
+   + "hl.bind(\"CTRL + ALT + SHIFT + F12\", hl.dsp.submap(\"reset\")) end)' >/dev/null && "
+   + "hyprctl dispatch 'hl.dsp.submap(\"ddc-input-select-record\")' >/dev/null; }",
+   "submap: enter, defining it only when missing")
+eq(M.leaveRecordSubmapArgs(), ["hyprctl", "dispatch", 'hl.dsp.submap("reset")'], "submap: leave")
+
+eq(M.resolveInput(bound, "0x0F"), "0x0f", "resolve: by code, any case")
+eq(M.resolveInput(bound, "11"), "0x11", "resolve: bare hex code")
+eq(M.resolveInput(bound, "displayport"), "0x0f", "resolve: by name, case-insensitive")
+eq(M.resolveInput(bound, "Nope"), "", "resolve: unknown name")
+eq(M.resolveInput([], "hdmi-1"), "0x11", "resolve: MCCS name works before discovery")
+eq(M.resolveInput([], "0x11"), "", "resolve: unknown code is left to the caller")
+eq(M.resolveInput(bound, ""), "", "resolve: empty")
+eq(M.resolveInput([{ code: "0x0a", name: "12" }, { code: "0x12", name: "x" }], "12"), "0x12",
+   "resolve: a code wins over a name that looks like one")
+
+// --- shortcut editor -------------------------------------------------------
+eq(M.parseBind("SHIFT + CTRL + 1"), { mods: ["CTRL", "SHIFT"], key: "1" },
+   "editor: parse orders modifiers")
+eq(M.parseBind("control+mod4+h"), { mods: ["SUPER", "CTRL"], key: "H" },
+   "editor: parse aliases and lowercase")
+eq(M.parseBind(""), { mods: [], key: "" }, "editor: parse empty")
+eq(M.formatBind(["SHIFT", "CTRL"], "1"), "CTRL + SHIFT + 1", "editor: format in fixed order")
+eq(M.formatBind(["SUPER"], ""), "SUPER", "editor: format without key")
+eq(M.canonicalBind("SHIFT + CTRL + 1"), M.canonicalBind("ctrl + shift + 1"),
+   "editor: two spellings, one shortcut")
+eq(M.canonicalBind("SHIFT"), "", "editor: modifiers alone are no shortcut")
+
+eq(M.keyNameFor(0x21, 10), "1", "key: Shift+1 reads the digit from the scan code")
+eq(M.keyNameFor(0x26, 19), "0", "key: scan code 19 is 0")
+eq(M.keyNameFor(0x33, 0), "3", "key: digit without scan code")
+eq(M.keyNameFor(0x48, 43), "H", "key: letter")
+eq(M.keyNameFor(0x01000030, 67), "F1", "key: F1")
+eq(M.keyNameFor(0x01000004, 36), "RETURN", "key: named key")
+eq(M.keyNameFor(0xdc, 34), "", "key: unknown is refused")
+
+eq(M.modsFromMask(5), ["CTRL", "SHIFT"], "mask: 5 is CTRL+SHIFT")
+eq(M.modsFromMask(64 | 8), ["SUPER", "ALT"], "mask: SUPER+ALT")
+
+const HYPR_BINDS = JSON.stringify([
+  { modmask: 5, key: "1", description: "Monitor input: VGA", dispatcher: "__lua", arg: "1", mouse: false, submap: "" },
+  { modmask: 64, key: "RETURN", description: "Terminal", dispatcher: "__lua", arg: "2", mouse: false, submap: "" },
+  { modmask: 64, key: "J", description: "", dispatcher: "togglesplit", arg: "", mouse: false, submap: "" },
+  { modmask: 64, key: "mouse:272", description: "Move", dispatcher: "movewindow", arg: "", mouse: true, submap: "" },
+  { modmask: 0, key: "escape", description: "Leave resize", dispatcher: "submap", arg: "reset", mouse: false, submap: "resize" }
+])
+eq(M.hyprConflicts(HYPR_BINDS, "SUPER + RETURN", "Monitor input: HDMI"), ["Terminal"],
+   "conflict: taken by another binding")
+eq(M.hyprConflicts(HYPR_BINDS, "CTRL + SHIFT + 1", "Monitor input: VGA"), [],
+   "conflict: the input's own shortcut is not a clash")
+eq(M.hyprConflicts(HYPR_BINDS, "SHIFT + CTRL + 1", "Monitor input: HDMI"), [],
+   "conflict: other inputs' shortcuts are left to inputConflicts")
+eq(M.hyprConflicts(HYPR_BINDS, "SUPER + J", "x"), ["togglesplit"],
+   "conflict: undescribed binding falls back to its dispatcher")
+eq(M.hyprConflicts(HYPR_BINDS, "ESCAPE", "x"), [], "conflict: submap bindings ignored")
+eq(M.hyprConflicts("not json", "SUPER + J", "x"), [], "conflict: bad JSON is no conflict")
+eq(M.inputConflicts(bound, "0x0f", "CTRL + SHIFT + 1"), [{ code: "0x01", name: "VGA" }],
+   "conflict: between inputs")
+eq(M.inputConflicts(bound, "0x01", "SHIFT + CTRL + 1"), [], "conflict: not with itself")
+
+const userConfig = '{\n  "inputs": [\n    { "code": "0x0F", "name": "Dock", "hidden": false, "note": "mine" },\n    { "code": "0x11", "name": "HDMI", "bind": "SUPER + H" }\n  ],\n  "extra": 1\n}\n'
+const W = (code, changes, takeFrom, text) => JSON.parse(M.configWithInput(text === undefined ? userConfig : text, code, changes, takeFrom))
+const withBind = M.configWithInput(userConfig, "0x0f", { bind: "CTRL + SHIFT + 2" })
+eq(JSON.parse(withBind).inputs[0], { code: "0x0F", name: "Dock", hidden: false, note: "mine", bind: "CTRL + SHIFT + 2" },
+   "write: bind added, untouched fields kept")
+eq(JSON.parse(withBind).extra, 1, "write: unknown top-level keys kept")
+eq(withBind.split("\n")[2], '    { "code": "0x0F", "name": "Dock", "hidden": false, "note": "mine", "bind": "CTRL + SHIFT + 2" },',
+   "write: one input per line")
+eq(W("0x11", { bind: "" }).inputs[1], { code: "0x11", name: "HDMI" }, "write: empty bind removes the field")
+eq(W("0x01", { name: "VGA-1", bind: "CTRL + 1" }).inputs[2],
+   { code: "0x01", name: "VGA-1", bind: "CTRL + 1" }, "write: unlisted input is appended")
+eq(W("0x01", { name: "VGA-1", bind: "CTRL + 1" }, [], ""),
+   { inputs: [{ code: "0x01", name: "VGA-1", bind: "CTRL + 1" }] }, "write: no config yet")
+eq(M.configWithInput("{bad", "0x01", { bind: "CTRL + 1" }), "", "write: refuses a broken config")
+eq(M.parseConfig(M.configWithInput("", "0x01", { name: 'A "q"' }))[0].name, 'A "q"',
+   "write: round-trips through parseConfig")
+eq(W("0x01", { bind: "" }, [], '{"inputs":[]}'), { inputs: [] },
+   "write: an appended entry with nothing to say is dropped")
+
+// renaming and hiding
+eq(W("0x0f", { name: "  Work Laptop " }).inputs[0].name, "Work Laptop", "rename: trimmed")
+eq("name" in W("0x0f", { name: "" }).inputs[0], false, "rename: empty name falls back to the default")
+eq(W("0x11", { hidden: true }).inputs[1].hidden, true, "hide: stored")
+eq("hidden" in W("0x0f", { hidden: false }).inputs[0], false, "hide: false removes the field")
+eq(W("0x11", { name: "TV" }).inputs[1].bind, "SUPER + H", "rename: bind untouched")
+
+// overrides and take-overs
+eq(W("0x0f", { bind: "SUPER + W", override: true }).inputs[0].override, true, "write: override is stored")
+eq("override" in W("0x0f", { bind: "SUPER + Q", override: false },
+     [], M.configWithInput(userConfig, "0x0f", { bind: "SUPER + W", override: true })).inputs[0],
+   false, "write: a later save without override drops it")
+eq("override" in W("0x0f", { bind: "", override: true }).inputs[0], false, "write: no override without a bind")
+eq(W("0x0f", { bind: "SUPER + H" }, ["0x11"]).inputs.map(e => e.bind),
+   ["SUPER + H", undefined], "write: takeFrom drops the other input's bind")
+eq(W("0x01", { name: "VGA", bind: "CTRL + 1", override: true }).inputs[2],
+   { code: "0x01", name: "VGA", bind: "CTRL + 1", override: true }, "write: appended input keeps override")
 
 // --- misc -----------------------------------------------------------------
 eq(M.labelFor(M.mergeInputs(discovered, configured), "0x13"), "Twilight", "labelFor")
@@ -155,6 +284,10 @@ eq(M.ddcutilArgs(0, ["getvcp", "60"]), ["ddcutil", "getvcp", "60"],
    "args: no display flag when 0")
 eq(M.ddcutilArgs(2, ["setvcp", "10", "+", "10"]),
    ["ddcutil", "--display", "2", "setvcp", "10", "+", "10"], "args: display flag")
+eq(M.ddcutilArgs(2, ["getvcp", "60"], 3), ["ddcutil", "--bus", "3", "getvcp", "60"],
+   "args: bus wins over display")
+eq(M.ddcutilArgs(0, ["getvcp", "60"], 0), ["ddcutil", "getvcp", "60"],
+   "args: bus 0 is off")
 eq(M.moveIndex(0, -1, 5), 4, "cursor wraps up")
 eq(M.moveIndex(4, 1, 5), 0, "cursor wraps down")
 eq(M.moveIndex(0, 1, 0), 0, "cursor handles empty list")
