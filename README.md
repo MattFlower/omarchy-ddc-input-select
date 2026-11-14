@@ -72,7 +72,9 @@ $ ddc-input-select --list
 
 `Input 0x19` and `Input 0x13` are unnamed because they're vendor extensions —
 Dell uses them for Thunderbolt and a second DisplayPort, and MCCS defines neither.
-That's what the config file is for. Seed one from the monitor and edit the names:
+That's what the config file is for. The plugin's Settings page writes it for you
+(see [Names, visibility and shortcuts](#names-visibility-and-shortcuts)); for the
+CLI, seed one from the monitor and edit the names:
 
 ```sh
 mkdir -p ~/.config/ddc-input-select
@@ -100,6 +102,8 @@ The config is an **overlay**, not the source of truth:
   `--current` — an input you chose not to list is still one you can be sitting on.
 - An entry the monitor never reported is kept, not dropped (capability strings do
   under-report), but the plugin dims it and marks the code with `?`.
+- `"bind"` gives an input its own keyboard shortcut. Only the Quattro plugin
+  reads it — see [Per-input shortcuts](#per-input-shortcuts).
 
 For reference, the codes a Dell U5226KW reports — note that `0x13` and `0x19`
 are outside the MCCS standard, which is exactly why detection beats a hardcoded
@@ -133,16 +137,13 @@ omarchy plugin add https://github.com/MattFlower/omarchy-ddc-input-select.git --
 ```
 
 The widget puts a 󰍹 icon in the bar. Left click opens a popup listing your
-inputs with the active one checked; click or arrow-and-Enter to switch. Middle
+inputs with the active one checked and each one's shortcut; click or arrow-and-Enter to switch. Middle
 click re-detects. Scrolling the icon nudges monitor brightness (VCP `0x10`),
 carrying over the `on-scroll` bindings from the old waybar module.
 
-A pencil icon sits beside the refresh icon in the popup header and opens the
-config in your Omarchy editor. With no config yet it creates the directory and
-file first — seeded with everything the monitor reported — so you land in a
-filled-in file and only have to replace names. Its tooltip says which of the two
-it will do, and names the path. It's also the last stop in the keyboard cursor,
-one step past the final input.
+A gear beside the refresh icon in the popup header (or `s`) opens the
+**Settings** page, where inputs are renamed, hidden and given shortcuts — see
+[Names, visibility and shortcuts](#names-visibility-and-shortcuts).
 
 Discovery runs on the first open of each shell session and is cached from then
 on — the monitor's input list doesn't change between reboots. Later opens only
@@ -159,6 +160,7 @@ Settings live under Setup > Plugins (or inline on the widget's entry in
 | Setting          | Default | Meaning                                                     |
 | ---------------- | ------- | ----------------------------------------------------------- |
 | `displayNumber`  | `0`     | `ddcutil --display N`; `0` lets ddcutil pick. Set this if you have more than one DDC monitor. |
+| `busNumber`      | `0`     | `ddcutil --bus N` (the `/dev/i2c-N` from `ddcutil detect`). Wins over `displayNumber`. For setups where the display number shifts, e.g. behind a dock that doesn't pass DDC/CI through. `0` turns it off. |
 | `showLabel`      | `false` | Print the active input's name next to the icon.             |
 | `brightnessStep` | `10`    | Scroll step for brightness; `0` disables scroll control.    |
 | `configPath`     | `""`    | Override the inputs JSON path.                              |
@@ -172,6 +174,95 @@ The popup is also reachable over IPC, which makes it bindable in
 ```sh
 omarchy-shell ddc-input toggle
 ```
+
+Switching straight to an input works the same way, by code or by name (the
+names from your config, or the standard ones such as `HDMI-1`):
+
+```sh
+omarchy-shell ddc-input set 0x11
+omarchy-shell ddc-input set "Work Laptop"
+```
+
+It prints `ok`, `busy` (another DDC call is still running) or `unknown input`.
+
+`omarchy-shell ddc-input settings` opens the popup straight on its Settings page.
+
+### Names, visibility and shortcuts
+
+The gear in the popup header (or `s`) opens the **Settings** page in place of
+the input list. It lists every input, hidden ones included, with its shortcut.
+Pick one by click or arrow-and-Enter to edit it below the list. The arrow
+button or Escape goes back.
+
+The editor shows:
+
+- **Port**: the input as the monitor knows it (`DisplayPort-1 · 0x0f`), so a
+  renamed input stays recognisable. The list shows it under each name too.
+- **Name**: what the popup and the shortcut descriptions call the input.
+  Clearing it brings back the standard name.
+- **Shortcut**: the current combination, or `none`.
+- **Show in the input list**: off hides the input from the popup's list
+  (`"hidden": true`). It keeps its shortcut.
+
+and four buttons:
+
+- **Clear** removes the shortcut.
+- **Record** listens for a new one: press the whole combination, e.g.
+  `Ctrl+Shift+2`. It needs at least one of Super, Ctrl, Alt or Shift.
+  - While it listens, Hyprland is switched into an empty submap, so none of
+    your shortcuts fire and the combination reaches the popup. That includes
+    one that is bound right now, such as the input's current shortcut.
+  - The submap is left as soon as a key is recorded, when the editor or
+    popup closes, and after 20 seconds at the latest. `Ctrl+Alt+Shift+F12`
+    leaves it by hand, should the shell ever go away mid-recording.
+  - Backspace clears the key, and Escape stops listening.
+- **Save** writes name, shortcut and visibility together. If the combination
+  is already in use, the editor says by what, and the button reads
+  **Override**: another input that had the shortcut loses it, and a Hyprland
+  binding (from `hyprctl binds`) is switched off by an `hl.unbind()` in the
+  generated module, stored as `"override": true` on the input. To pick
+  something else instead, Record again.
+- **Cancel** closes the editor without saving.
+
+Saving writes into `inputs.json`, keeping everything else in the file. An
+input that isn't listed there yet is added. A name equal to the standard one
+isn't stored, so the file stays an overlay.
+
+Under the hood each shortcut is a `"bind"` on its input in `inputs.json`, in
+the same key syntax Omarchy's `bindings.lua` uses, so the file can still be
+edited by hand:
+
+```json
+{
+  "inputs": [
+    { "code": "0x0F", "name": "DisplayPort", "bind": "SHIFT + CTRL + 1" },
+    { "code": "0x11", "name": "Work Laptop", "bind": "SHIFT + CTRL + 2" },
+    { "code": "0x12", "name": "HDMI 2", "hidden": true, "bind": "SHIFT + CTRL + 3" }
+  ]
+}
+```
+
+The plugin turns these into `~/.config/hypr/ddc-input-select.lua`, one
+`o.bind()` per input calling `omarchy-shell ddc-input set <code>`, and runs
+`hyprctl reload` whenever that file changes. Load it once, at the **end** of
+`~/.config/hypr/bindings.lua` so that an override can switch off bindings made
+above it:
+
+```lua
+require("hypr.ddc-input-select")
+```
+
+Until that line is there, the Settings page says so.
+
+- The plugin writes only that one file and never touches `bindings.lua` itself.
+  Nothing is created until the first `bind` exists.
+- Removing every `bind` leaves an empty module behind, so the `require` keeps
+  working.
+- A config that isn't valid JSON leaves the file as it was. A typo while
+  editing doesn't wipe working shortcuts.
+- Hidden inputs keep their shortcut. Hiding only affects the popup list.
+- The shortcuts go through the running shell, so the plugin has to be enabled
+  for them to work.
 
 ### Hacking on it
 
